@@ -9,6 +9,7 @@ clients:
   - url: http://loki:3100/loki/api/v1/push
 
 scrape_configs:
+  # 监听系统日志
   - job_name: system
     static_configs:
       - targets:
@@ -16,3 +17,85 @@ scrape_configs:
         labels:
           job: varlogs
           __path__: /var/log/*log
+
+  # 监听 Docker 容器日志
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["logging=promtail"]
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container_name'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'logstream'
+      - source_labels: ['__meta_docker_container_label_logging']
+        target_label: 'logging'
+    pipeline_stages:
+      # 解析 Docker 日志格式
+      - docker: {}
+      # 尝试解析 JSON 格式的日志内容
+      - match:
+          selector: '{job="docker"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  message: message
+                  timestamp: timestamp
+                  service: service
+                  trace_id: trace_id
+                  span_id: span_id
+            # 如果有 timestamp 字段，使用它作为日志时间
+            - timestamp:
+                source: timestamp
+                format: RFC3339Nano
+                fallback_formats:
+                  - RFC3339
+                  - "2006-01-02T15:04:05.000Z"
+                  - "2006-01-02 15:04:05"
+            # 设置日志级别标签
+            - labels:
+                level:
+                service:
+                trace_id:
+                span_id:
+
+  # 监听所有 Docker 容器日志（不需要特定标签）
+  - job_name: docker_all
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container_name'
+      - source_labels: ['__meta_docker_container_image']
+        target_label: 'image'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+      # 排除 Loki 相关容器避免循环
+      - source_labels: ['__meta_docker_container_name']
+        regex: '.*(loki|promtail|grafana).*'
+        action: drop
+    pipeline_stages:
+      - docker: {}
+      # 尝试解析 JSON，如果失败则保持原始格式
+      - match:
+          selector: '{job="docker_all"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  msg: message
+                  time: timestamp
+                  service: service
+                  component: component
+                drop_malformed: false
+            - labels:
+                level:
+                service:
+                component:
